@@ -1,0 +1,865 @@
+#include <Arduino.h>
+#include <ESP8266WiFi.h>
+#include <SinricPro.h>
+#include <SinricProSwitch.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <time.h>
+#include <math.h>
+
+// =====================================
+// WIFI CREDENTIALS
+// =====================================
+
+#define WIFI_SSID       "xxxxxxx"
+#define WIFI_PASSWORD   "xxxxxxxxxx"
+
+// =====================================
+// SINRIC PRO CREDENTIALS
+// =====================================
+
+#define APP_KEY         "xxxxxxxxxxxxxxxxx"
+#define APP_SECRET      "xxxxxxxxxxxxxxxxx"
+#define DEVICE_ID       "xxxx"
+
+// =====================================
+// PIN CONFIGURATION
+// =====================================
+
+#define DEMO_LED_PIN D4
+
+#define OLED_SDA D2
+#define OLED_SCL D1
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1
+
+// =====================================
+// RELAY CONFIG (ACTIVE LOW)
+// true  = relay LOW signal par ON hoga
+// false = relay HIGH signal par ON hoga
+// =====================================
+
+#define RELAY_ACTIVE_LOW true
+
+inline void relayOn() {
+  digitalWrite(DEMO_LED_PIN, RELAY_ACTIVE_LOW ? LOW : HIGH);
+}
+
+inline void relayOff() {
+  digitalWrite(DEMO_LED_PIN, RELAY_ACTIVE_LOW ? HIGH : LOW);
+}
+
+// =====================================
+// BUZZER CONFIG
+// Active buzzer: + pin D6 se, - pin GND se
+// Agar buzzer module active LOW hai to false ko true kar do
+// =====================================
+
+#define BUZZER_PIN D6
+#define BUZZER_ACTIVE_LOW false
+
+#define BEEP_TIME 150UL        // 1 se 9 tak chhota beep
+#define LAST_BEEP_TIME 500UL   // 10 par lamba beep
+
+inline void buzzerOn() {
+  digitalWrite(BUZZER_PIN, BUZZER_ACTIVE_LOW ? LOW : HIGH);
+}
+
+inline void buzzerOff() {
+  digitalWrite(BUZZER_PIN, BUZZER_ACTIVE_LOW ? HIGH : LOW);
+}
+
+int lastBeepCount = 0;
+bool buzzerBeeping = false;
+unsigned long beepStartTime = 0;
+unsigned long beepDuration = 0;
+
+void startBeep(unsigned long duration) {
+  buzzerOn();
+  buzzerBeeping = true;
+  beepStartTime = millis();
+  beepDuration = duration;
+}
+
+void stopBuzzer() {
+  buzzerOff();
+  buzzerBeeping = false;
+}
+
+void handleBuzzer() {
+  if (buzzerBeeping && millis() - beepStartTime >= beepDuration) {
+    stopBuzzer();
+  }
+}
+
+// =====================================
+// TIMING
+// =====================================
+
+#define COUNTDOWN_TIME 10000UL
+#define ACTIVE_TIME 5000UL
+#define OLED_REFRESH 80UL
+#define FINAL_SCREEN_TIME 3000UL
+
+// =====================================
+// OLED INITIALIZATION
+// =====================================
+
+Adafruit_SSD1306 display(
+  SCREEN_WIDTH,
+  SCREEN_HEIGHT,
+  &Wire,
+  OLED_RESET
+);
+
+// =====================================
+// SYSTEM STATES
+// =====================================
+
+enum SystemState {
+  SYSTEM_IDLE,
+  SYSTEM_COUNTDOWN,
+  SYSTEM_ACTIVE,
+  SYSTEM_COMPLETE
+};
+
+SystemState systemState = SYSTEM_IDLE;
+
+// =====================================
+// SYSTEM VARIABLES
+// =====================================
+
+bool oledReady = false;
+bool sinricConnected = false;
+bool sequenceStarted = false;
+
+unsigned long phaseStartTime = 0;
+unsigned long lastDisplayUpdate = 0;
+unsigned long completeScreenTime = 0;
+
+// =====================================
+// TIME SETUP - INDIA IST
+// =====================================
+
+void setupTime() {
+
+  // UTC +5:30 = 19800 seconds
+
+  configTime(
+    19800,
+    0,
+    "pool.ntp.org",
+    "time.google.com"
+  );
+
+  Serial.println("Time Synchronization Started");
+
+}
+
+// =====================================
+// FIREWORKS ANIMATION
+// =====================================
+
+void drawFireworkBurst(
+  int cx,
+  int cy,
+  unsigned long age,
+  int rayCount,
+  int maxRadius,
+  float angleOffset
+) {
+
+  const unsigned long burstDuration = 1100;
+
+  if (age >= burstDuration) return;
+
+  float progress = (float)age / burstDuration;
+
+  int radius = 3 + (int)(progress * maxRadius);
+
+  if (age < 120) {
+    display.fillCircle(cx, cy, 2, WHITE);
+  }
+
+  for (int i = 0; i < rayCount; i++) {
+
+    float angle = (6.28318f * i / rayCount) + angleOffset;
+
+    float length = radius * (0.65f + 0.35f * ((i % 3) / 2.0f));
+
+    float dx = cos(angle);
+    float dy = sin(angle);
+
+    float px = -dy;
+    float py = dx;
+
+    int x1 = cx + (int)(dx * 2);
+    int y1 = cy + (int)(dy * 2);
+
+    int xm = cx + (int)(dx * length * 0.55f + px * 2);
+    int ym = cy + (int)(dy * length * 0.55f + py * 2);
+
+    int x2 = cx + (int)(dx * length);
+    int y2 = cy + (int)(dy * length);
+
+    display.drawLine(x1, y1, xm, ym, WHITE);
+    display.drawLine(xm, ym, x2, y2, WHITE);
+
+    if (age > 250) {
+      display.drawPixel(
+        x2 + (int)(px * 2),
+        y2 + (int)(py * 2),
+        WHITE
+      );
+    }
+
+    if (i % 3 == 0 && age > 400) {
+
+      int sx = cx + (int)(dx * (length + 3));
+      int sy = cy + (int)(dy * (length + 3));
+
+      display.drawPixel(sx, sy, WHITE);
+
+    }
+
+  }
+
+  if (age < 400) {
+    display.fillCircle(cx, cy, 2, WHITE);
+  }
+
+}
+
+// =====================================
+// DIWALI FIREWORKS DISPLAY
+// =====================================
+
+void drawDiwaliAnimation() {
+
+  display.clearDisplay();
+
+  display.setTextColor(WHITE);
+
+  unsigned long t = millis() - phaseStartTime;
+
+  int count = (t / 1000) + 1;
+
+  if (count > 5) count = 5;
+
+  display.setTextSize(1);
+
+  display.setCursor(35, 0);
+
+  display.println("DIWALI FIRE");
+
+  display.drawLine(0, 10, 128, 10, WHITE);
+
+  unsigned long cycle = 1500;
+
+  // LEFT FIREWORK
+  drawFireworkBurst(20, 29, t % cycle, 10, 16, 0.0f);
+
+  // CENTER FIREWORK
+  drawFireworkBurst(64, 25, (t + 500) % cycle, 14, 19, 0.2f);
+
+  // RIGHT FIREWORK
+  drawFireworkBurst(107, 30, (t + 950) % cycle, 10, 16, 0.4f);
+
+  // BOTTOM FIREWORK
+  drawFireworkBurst(43, 40, (t + 1200) % cycle, 8, 8, 0.3f);
+
+  // COUNTDOWN NUMBER ONLY
+
+  display.setTextSize(1);
+
+  display.setCursor(0, 55);
+
+  display.print("DIWALI MODE");
+
+  display.setTextSize(2);
+
+  display.setCursor(105, 49);
+
+  display.print(count);
+
+  display.display();
+
+}
+
+// =====================================
+// OLED DISPLAY FUNCTION
+// =====================================
+
+void updateDisplay() {
+
+  if (!oledReady) return;
+
+  display.clearDisplay();
+
+  display.setTextColor(WHITE);
+
+  // =================================
+  // WIFI SEARCHING SCREEN
+  // =================================
+
+  if (WiFi.status() != WL_CONNECTED) {
+
+    display.setTextSize(1);
+
+    display.setCursor(15, 5);
+
+    display.println("WIFI STATUS");
+
+    display.drawLine(0, 17, 128, 17, WHITE);
+
+    display.setCursor(5, 27);
+
+    display.println("Searching WiFi...");
+
+    display.setCursor(5, 42);
+
+    display.println("Please Wait...");
+
+    display.display();
+
+    return;
+
+  }
+
+  // =================================
+  // SYSTEM STATUS + DATE & TIME
+  // =================================
+
+  if (systemState == SYSTEM_IDLE && !sequenceStarted) {
+
+    display.setTextSize(1);
+
+    display.setCursor(20, 0);
+
+    display.println("SYSTEM STATUS");
+
+    display.drawLine(0, 12, 128, 12, WHITE);
+
+    display.setCursor(0, 17);
+
+    display.println("WiFi: CONNECTED");
+
+    display.setCursor(0, 27);
+
+    display.print("Cloud: ");
+
+    display.println(sinricConnected ? "ONLINE" : "OFFLINE");
+
+    // GET CURRENT TIME
+
+    time_t now = time(nullptr);
+
+    struct tm timeInfo;
+
+    if (now > 100000 && localtime_r(&now, &timeInfo)) {
+
+      char dateBuffer[20];
+      char timeBuffer[20];
+
+      // DATE FORMAT DD-MM-YYYY
+      strftime(dateBuffer, sizeof(dateBuffer), "%d-%m-%Y", &timeInfo);
+
+      // TIME FORMAT 12 HOUR AM/PM
+      strftime(timeBuffer, sizeof(timeBuffer), "%I:%M:%S %p", &timeInfo);
+
+      display.setCursor(0, 37);
+
+      display.print("Date: ");
+
+      display.println(dateBuffer);
+
+      display.setCursor(0, 47);
+
+      display.print("Time: ");
+
+      display.println(timeBuffer);
+
+    }
+
+    else {
+
+      display.setCursor(0, 42);
+
+      display.println("Time: Syncing...");
+
+    }
+
+    display.display();
+
+    return;
+
+  }
+
+  // =================================
+  // 10 SECOND COUNTDOWN
+  // =================================
+
+  if (systemState == SYSTEM_COUNTDOWN) {
+
+    unsigned long elapsed = millis() - phaseStartTime;
+
+    int count = (elapsed / 1000) + 1;
+
+    if (count > 10) count = 10;
+
+    display.setTextSize(1);
+
+    display.setCursor(32, 5);
+
+    display.println("DIWALI MODE");
+
+    display.drawLine(0, 17, 128, 17, WHITE);
+
+    display.setTextSize(4);
+
+    display.setCursor(count < 10 ? 52 : 40, 27);
+
+    display.print(count);
+
+    display.display();
+
+    return;
+
+  }
+
+  // =================================
+  // 5 SECOND FIREWORKS ANIMATION
+  // =================================
+
+  if (systemState == SYSTEM_ACTIVE) {
+
+    drawDiwaliAnimation();
+
+    return;
+
+  }
+
+  // =================================
+  // FINAL STATUS SCREEN
+  // =================================
+
+  if (systemState == SYSTEM_COMPLETE) {
+
+    display.setTextSize(1);
+
+    display.setCursor(0, 3);
+
+    display.println("FINAL STATUS");
+
+    display.drawLine(0, 14, 128, 14, WHITE);
+
+    display.setCursor(0, 19);
+
+    display.println(
+      WiFi.status() == WL_CONNECTED
+      ? "WiFi: CONNECTED"
+      : "WiFi: OFFLINE"
+    );
+
+    display.setCursor(0, 29);
+
+    display.print("Sinric: ");
+
+    display.println(sinricConnected ? "ONLINE" : "OFFLINE");
+
+    display.setCursor(0, 39);
+
+    display.println("Counting: COMPLETE");
+
+    display.setCursor(0, 51);
+
+    display.println("DIWALI MODE: OFF");
+
+    display.display();
+
+    return;
+
+  }
+
+  // =================================
+  // SYSTEM READY SCREEN
+  // =================================
+
+  display.setTextSize(2);
+
+  display.setCursor(27, 8);
+
+  display.println("DIWALI");
+
+  display.setCursor(12, 29);
+
+  display.println("MODE: OFF");
+
+  display.setTextSize(1);
+
+  display.setCursor(24, 53);
+
+  display.println("SYSTEM READY");
+
+  display.display();
+
+}
+
+// =====================================
+// START SEQUENCE
+// =====================================
+
+void startSequence() {
+
+  if (
+    systemState == SYSTEM_COUNTDOWN ||
+    systemState == SYSTEM_ACTIVE
+  ) {
+    return;
+  }
+
+  relayOff();
+
+  stopBuzzer();
+
+  lastBeepCount = 0;
+
+  sequenceStarted = true;
+
+  systemState = SYSTEM_COUNTDOWN;
+
+  phaseStartTime = millis();
+
+  Serial.println("SEQUENCE STARTED");
+
+  Serial.println("10 SECOND COUNTDOWN");
+
+  updateDisplay();
+
+}
+
+// =====================================
+// STOP SEQUENCE
+// =====================================
+
+void stopSequence() {
+
+  relayOff();
+
+  stopBuzzer();
+
+  lastBeepCount = 0;
+
+  sequenceStarted = false;
+
+  systemState = SYSTEM_IDLE;
+
+  Serial.println("SYSTEM OFF");
+
+  updateDisplay();
+
+}
+
+// =====================================
+// SINRIC PRO CALLBACK
+// =====================================
+
+bool onPowerState(
+  const String &deviceId,
+  bool &state
+) {
+
+  Serial.println("SINRIC COMMAND RECEIVED");
+
+  if (state) {
+    startSequence();
+  }
+
+  else {
+    stopSequence();
+  }
+
+  return true;
+
+}
+
+// =====================================
+// SEQUENCE HANDLER
+// =====================================
+
+void handleSequence() {
+
+  unsigned long elapsed = millis() - phaseStartTime;
+
+  // BUZZER BEEP: HAR COUNT (1 se 10) PAR
+
+  if (systemState == SYSTEM_COUNTDOWN) {
+
+    int count = (elapsed / 1000) + 1;
+
+    if (count > 10) count = 10;
+
+    if (count != lastBeepCount) {
+
+      lastBeepCount = count;
+
+      startBeep(count == 10 ? LAST_BEEP_TIME : BEEP_TIME);
+
+      Serial.print("BEEP: ");
+
+      Serial.println(count);
+
+    }
+
+  }
+
+  // 10 SECOND COUNTDOWN COMPLETE
+
+  if (
+    systemState == SYSTEM_COUNTDOWN &&
+    elapsed >= COUNTDOWN_TIME
+  ) {
+
+    systemState = SYSTEM_ACTIVE;
+
+    phaseStartTime = millis();
+
+    relayOn();
+
+    Serial.println("COUNTDOWN COMPLETE");
+
+    Serial.println("FIREWORKS STARTED");
+
+  }
+
+  // 5 SECOND ANIMATION COMPLETE
+
+  else if (
+    systemState == SYSTEM_ACTIVE &&
+    elapsed >= ACTIVE_TIME
+  ) {
+
+    relayOff();
+
+    systemState = SYSTEM_COMPLETE;
+
+    completeScreenTime = millis();
+
+    Serial.println("DIWALI MODE OFF");
+
+    Serial.println("COUNTING COMPLETE");
+
+    if (sinricConnected) {
+
+      SinricProSwitch &mySwitch = SinricPro[DEVICE_ID];
+
+      mySwitch.sendPowerStateEvent(false);
+
+    }
+
+  }
+
+  // FINAL SCREEN FOR 3 SECONDS
+
+  else if (
+    systemState == SYSTEM_COMPLETE &&
+    millis() - completeScreenTime >= FINAL_SCREEN_TIME
+  ) {
+
+    systemState = SYSTEM_IDLE;
+
+    sequenceStarted = false;
+
+    Serial.println("SYSTEM READY");
+
+  }
+
+}
+
+// =====================================
+// WIFI SETUP
+// =====================================
+
+void setupWiFi() {
+
+  WiFi.mode(WIFI_STA);
+
+  WiFi.setAutoReconnect(true);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+  Serial.println("CONNECTING WIFI...");
+
+  while (WiFi.status() != WL_CONNECTED) {
+
+    updateDisplay();
+
+    delay(500);
+
+    Serial.print(".");
+
+  }
+
+  Serial.println();
+
+  Serial.println("WIFI CONNECTED");
+
+  Serial.println(WiFi.localIP());
+
+}
+
+// =====================================
+// SINRIC PRO SETUP
+// =====================================
+
+void setupSinric() {
+
+  SinricProSwitch &mySwitch = SinricPro[DEVICE_ID];
+
+  mySwitch.onPowerState(onPowerState);
+
+  SinricPro.onConnected([]() {
+
+    sinricConnected = true;
+
+    Serial.println("SINRIC CONNECTED");
+
+    updateDisplay();
+
+  });
+
+  SinricPro.onDisconnected([]() {
+
+    sinricConnected = false;
+
+    Serial.println("SINRIC DISCONNECTED");
+
+    updateDisplay();
+
+  });
+
+  SinricPro.begin(APP_KEY, APP_SECRET);
+
+}
+
+// =====================================
+// MAIN SETUP
+// =====================================
+
+void setup() {
+
+  // RELAY PEHLE OFF KARO (active LOW => pin HIGH)
+  pinMode(DEMO_LED_PIN, OUTPUT);
+  relayOff();
+
+  pinMode(BUZZER_PIN, OUTPUT);
+  buzzerOff();
+
+  Serial.begin(115200);
+
+  Serial.println();
+
+  Serial.println("==========================");
+
+  Serial.println(" SMART DIWALI SYSTEM 2026");
+
+  Serial.println("==========================");
+
+  // OLED INITIALIZATION
+
+  Wire.begin(OLED_SDA, OLED_SCL);
+
+  if (display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+
+    oledReady = true;
+
+    display.clearDisplay();
+
+    display.setTextColor(WHITE);
+
+    // HAPPY DIWALI WELCOME SCREEN
+
+    display.setTextSize(2);
+
+    display.setCursor(34, 5);
+
+    display.println("HAPPY");
+
+    display.setCursor(28, 24);
+
+    display.println("DIWALI");
+
+    display.setCursor(40, 43);
+
+    display.println("2026");
+
+    display.display();
+
+    delay(2500);
+
+  }
+
+  else {
+
+    Serial.println("OLED NOT FOUND!");
+
+  }
+
+  // WIFI INITIALIZATION
+  setupWiFi();
+
+  // NTP DATE AND TIME
+  setupTime();
+
+  // SINRIC INITIALIZATION
+  setupSinric();
+
+  updateDisplay();
+
+}
+
+// =====================================
+// MAIN LOOP
+// =====================================
+
+void loop() {
+
+  // WIFI AUTO RECONNECT
+
+  if (WiFi.status() != WL_CONNECTED) {
+
+    static unsigned long lastReconnect = 0;
+
+    if (millis() - lastReconnect >= 10000) {
+
+      lastReconnect = millis();
+
+      WiFi.reconnect();
+
+    }
+
+  }
+
+  // SINRIC PRO HANDLE
+  SinricPro.handle();
+
+  // SEQUENCE HANDLER
+  handleSequence();
+
+  // BUZZER HANDLER (beep band karne ke liye)
+  handleBuzzer();
+
+  // OLED REFRESH
+
+  if (millis() - lastDisplayUpdate >= OLED_REFRESH) {
+
+    lastDisplayUpdate = millis();
+
+    updateDisplay();
+
+  }
+
+}
